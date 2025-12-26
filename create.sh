@@ -1,129 +1,275 @@
 #!/bin/bash
-set -vx
+set -euo pipefail
 
+# Script to create Azure resources and service principal for ARO cluster deployment
+# This script should be customized with your specific values before running
 
-# ARO cluster name
-#resourcePrefix="<azure-resources-name-prefix>"
-resourcePrefix="aro-openshit-dev-cac-001"
-#aroDomain="${resourcePrefix,,}"
-aroDomain="xyz"
-#aroClusterServicePrincipalDisplayName="${resourcePrefix}-aro-sp-${RANDOM}"
-aroClusterServicePrincipalDisplayName="${resourcePrefix}-sp"
-pullSecret=$(cat /Users/alirezarahmani/Repo/aro-azapi-terraform/pull-secret.txt)
-# Name and location of the resource group for the Azure Red Hat OpenShift (ARO) cluster
-aroResourceGroupName="${resourcePrefix}-RG"
-location="canadacentral"
+# Configuration - CUSTOMIZE THESE VALUES
+# ARO cluster name prefix (lowercase alphanumeric and hyphens only, max 15 chars)
+RESOURCE_PREFIX="${RESOURCE_PREFIX:-aro-dev-001}"
+# ARO domain (lowercase alphanumeric and hyphens only, 1-15 chars)
+ARO_DOMAIN="${ARO_DOMAIN:-${RESOURCE_PREFIX}}"
+# Azure location
+LOCATION="${LOCATION:-canadacentral}"
+# Path to Red Hat pull secret file (optional, leave empty for public clusters)
+PULL_SECRET_FILE="${PULL_SECRET_FILE:-}"
 
-# Subscription id, subscription name, and tenant id of the current subscription
-subscriptionId=$(az account show --query id --output tsv)
-subscriptionName=$(az account show --query name --output tsv)
-tenantId=$(az account show --query tenantId --output tsv)
+# Derived values
+ARO_CLUSTER_SERVICE_PRINCIPAL_DISPLAY_NAME="${RESOURCE_PREFIX}-aro-sp-${RANDOM:-$$}"
+ARO_RESOURCE_GROUP_NAME="${RESOURCE_PREFIX}-RG"
 
-# Register the necessary resource providers
-az provider register --namespace 'Microsoft.RedHatOpenShift' --wait
-az provider register --namespace 'Microsoft.Compute' --wait
-az provider register --namespace 'Microsoft.Storage' --wait
-az provider register --namespace 'Microsoft.Authorization' --wait
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
-# Check if the resource group already exists
-echo "Checking if [$aroResourceGroupName] resource group actually exists in the [$subscriptionName] subscription..."
+# Error handling function
+error_exit() {
+    echo -e "${RED}ERROR: $1${NC}" >&2
+    exit 1
+}
 
-az group show --name $aroResourceGroupName &>/dev/null
+# Success message function
+success_msg() {
+    echo -e "${GREEN}SUCCESS: $1${NC}"
+}
 
-if [[ $? != 0 ]]; then
-  echo "No [$aroResourceGroupName] resource group actually exists in the [$subscriptionName] subscription"
-  echo "Creating [$aroResourceGroupName] resource group in the [$subscriptionName] subscription..."
+# Warning message function
+warning_msg() {
+    echo -e "${YELLOW}WARNING: $1${NC}"
+}
 
-  # Create the resource group
-  az group create --name $aroResourceGroupName --location $location 1>/dev/null
+# Check prerequisites
+check_prerequisites() {
+    echo "Checking prerequisites..."
+    
+    if ! command -v az &> /dev/null; then
+        error_exit "Azure CLI is not installed. Please install it from https://learn.microsoft.com/en-us/cli/azure/install-azure-cli"
+    fi
+    
+    if ! command -v jq &> /dev/null; then
+        error_exit "jq is not installed. Please install it from https://stedolan.github.io/jq/download/"
+    fi
+    
+    # Check if logged in to Azure
+    if ! az account show &>/dev/null; then
+        error_exit "Not logged in to Azure. Please run 'az login' first."
+    fi
+    
+    success_msg "Prerequisites check passed"
+}
 
-  if [[ $? == 0 ]]; then
-    echo "[$aroResourceGroupName] resource group successfully created in the [$subscriptionName] subscription"
-  else
-    echo "Failed to create [$aroResourceGroupName] resource group in the [$subscriptionName] subscription"
-    exit
-  fi
-else
-  echo "[$aroResourceGroupName] resource group already exists in the [$subscriptionName] subscription"
-fi
+# Validate configuration
+validate_config() {
+    echo "Validating configuration..."
+    
+    if [[ ! "${RESOURCE_PREFIX}" =~ ^[a-z0-9-]{1,15}$ ]] || [[ "${RESOURCE_PREFIX}" =~ ^- ]] || [[ "${RESOURCE_PREFIX}" =~ -$ ]]; then
+        error_exit "RESOURCE_PREFIX must be lowercase alphanumeric and hyphens only, max 15 characters, and cannot start or end with a hyphen."
+    fi
+    
+    if [[ ! "${ARO_DOMAIN}" =~ ^[a-z0-9-]{1,15}$ ]] || [[ "${ARO_DOMAIN}" =~ ^- ]] || [[ "${ARO_DOMAIN}" =~ -$ ]]; then
+        error_exit "ARO_DOMAIN must be lowercase alphanumeric and hyphens only, 1-15 characters, and cannot start or end with a hyphen."
+    fi
+    
+    if [[ -n "${PULL_SECRET_FILE}" ]] && [[ ! -f "${PULL_SECRET_FILE}" ]]; then
+        error_exit "Pull secret file not found: ${PULL_SECRET_FILE}"
+    fi
+    
+    success_msg "Configuration validation passed"
+}
 
-# Create the service principal for the Azure Red Hat OpenShift (ARO) cluster
-echo "Creating service principal with [$aroClusterServicePrincipalDisplayName] display name in the [$tenantId] tenant..."
-az ad sp create-for-rbac --name $aroClusterServicePrincipalDisplayName > app-service-principal.json
+# Get Azure subscription information
+get_subscription_info() {
+    echo "Getting Azure subscription information..."
+    SUBSCRIPTION_ID=$(az account show --query id --output tsv) || error_exit "Failed to get subscription ID"
+    SUBSCRIPTION_NAME=$(az account show --query name --output tsv) || error_exit "Failed to get subscription name"
+    TENANT_ID=$(az account show --query tenantId --output tsv) || error_exit "Failed to get tenant ID"
+    
+    echo "Subscription: ${SUBSCRIPTION_NAME} (${SUBSCRIPTION_ID})"
+    echo "Tenant: ${TENANT_ID}"
+}
 
-aroClusterServicePrincipalClientId=$(jq -r '.appId' app-service-principal.json)
-aroClusterServicePrincipalClientSecret=$(jq -r '.password' app-service-principal.json)
-aroClusterServicePrincipalObjectId=$(az ad sp show --id $aroClusterServicePrincipalClientId | jq -r '.id')
+# Register resource providers
+register_providers() {
+    echo "Registering Azure resource providers..."
+    
+    local providers=(
+        "Microsoft.RedHatOpenShift"
+        "Microsoft.Compute"
+        "Microsoft.Storage"
+        "Microsoft.Authorization"
+    )
+    
+    for provider in "${providers[@]}"; do
+        echo "Registering ${provider}..."
+        if az provider register --namespace "${provider}" --wait; then
+            success_msg "${provider} registered successfully"
+        else
+            error_exit "Failed to register ${provider}"
+        fi
+    done
+}
 
-# Assign the User Access Administrator role to the new service principal with resource group scope
-roleName='User Access Administrator'
-az role assignment create \
-  --role "$roleName" \
-  --assignee-object-id $aroClusterServicePrincipalObjectId \
-  --resource-group $aroResourceGroupName \
-  --assignee-principal-type 'ServicePrincipal' >/dev/null
+# Create resource group
+create_resource_group() {
+    echo "Checking if resource group [${ARO_RESOURCE_GROUP_NAME}] exists..."
+    
+    if az group show --name "${ARO_RESOURCE_GROUP_NAME}" &>/dev/null; then
+        warning_msg "Resource group [${ARO_RESOURCE_GROUP_NAME}] already exists"
+    else
+        echo "Creating resource group [${ARO_RESOURCE_GROUP_NAME}] in [${LOCATION}]..."
+        if az group create --name "${ARO_RESOURCE_GROUP_NAME}" --location "${LOCATION}" &>/dev/null; then
+            success_msg "Resource group [${ARO_RESOURCE_GROUP_NAME}] created successfully"
+        else
+            error_exit "Failed to create resource group [${ARO_RESOURCE_GROUP_NAME}]"
+        fi
+    fi
+}
 
-if [[ $? == 0 ]]; then
-  echo "[$aroClusterServicePrincipalDisplayName] service principal successfully assigned [$roleName] with [$aroResourceGroupName] resource group scope"
-else
-  echo "Failed to assign [$roleName] role with [$aroResourceGroupName] resource group scope to the [$aroClusterServicePrincipalDisplayName] service principal"
-  exit
-fi
+# Create service principal
+create_service_principal() {
+    echo "Creating service principal [${ARO_CLUSTER_SERVICE_PRINCIPAL_DISPLAY_NAME}]..."
+    
+    local sp_file="app-service-principal.json"
+    
+    if az ad sp create-for-rbac --name "${ARO_CLUSTER_SERVICE_PRINCIPAL_DISPLAY_NAME}" > "${sp_file}" 2>/dev/null; then
+        ARO_CLUSTER_SERVICE_PRINCIPAL_CLIENT_ID=$(jq -r '.appId' "${sp_file}") || error_exit "Failed to extract client ID"
+        ARO_CLUSTER_SERVICE_PRINCIPAL_CLIENT_SECRET=$(jq -r '.password' "${sp_file}") || error_exit "Failed to extract client secret"
+        ARO_CLUSTER_SERVICE_PRINCIPAL_OBJECT_ID=$(az ad sp show --id "${ARO_CLUSTER_SERVICE_PRINCIPAL_CLIENT_ID}" --query id -o tsv) || error_exit "Failed to get object ID"
+        
+        success_msg "Service principal created successfully"
+    else
+        error_exit "Failed to create service principal"
+    fi
+    
+    # Clean up temporary file
+    rm -f "${sp_file}"
+}
 
-# Assign the Contributor role to the new service principal with resource group scope
-roleName='Contributor'
-az role assignment create \
-  --role "$roleName" \
-  --assignee-object-id $aroClusterServicePrincipalObjectId \
-  --resource-group $aroResourceGroupName \
-  --assignee-principal-type 'ServicePrincipal' >/dev/null
+# Assign roles to service principal
+assign_roles() {
+    echo "Assigning roles to service principal..."
+    
+    local roles=("User Access Administrator" "Contributor")
+    
+    for role in "${roles[@]}"; do
+        echo "Assigning role [${role}]..."
+        if az role assignment create \
+            --role "${role}" \
+            --assignee-object-id "${ARO_CLUSTER_SERVICE_PRINCIPAL_OBJECT_ID}" \
+            --resource-group "${ARO_RESOURCE_GROUP_NAME}" \
+            --assignee-principal-type "ServicePrincipal" &>/dev/null; then
+            success_msg "Role [${role}] assigned successfully"
+        else
+            error_exit "Failed to assign role [${role}]"
+        fi
+    done
+}
 
-if [[ $? == 0 ]]; then
-  echo "[$aroClusterServicePrincipalDisplayName] service principal successfully assigned [$roleName] with [$aroResourceGroupName] resource group scope"
-else
-  echo "Failed to assign [$roleName] role with [$aroResourceGroupName] resource group scope to the [$aroClusterServicePrincipalDisplayName] service principal"
-  exit
-fi
+# Get ARO resource provider service principal
+get_aro_rp_sp() {
+    echo "Getting Azure Red Hat OpenShift Resource Provider service principal..."
+    ARO_RESOURCE_PROVIDER_SERVICE_PRINCIPAL_OBJECT_ID=$(az ad sp list --display-name "Azure Red Hat OpenShift RP" --query "[0].id" -o tsv) || error_exit "Failed to get ARO RP service principal"
+    
+    if [[ -z "${ARO_RESOURCE_PROVIDER_SERVICE_PRINCIPAL_OBJECT_ID}" ]] || [[ "${ARO_RESOURCE_PROVIDER_SERVICE_PRINCIPAL_OBJECT_ID}" == "null" ]]; then
+        error_exit "Azure Red Hat OpenShift Resource Provider service principal not found"
+    fi
+    
+    success_msg "ARO RP service principal retrieved"
+}
 
-# Get the service principal object ID for the OpenShift resource provider
-# aroResourceProviderServicePrincipalObjectId=$(az ad sp list --display-name "Azure Red Hat OpenShift RP" --query "[0].id" -o tsv) >> app-service-principal.json
+# Read pull secret
+read_pull_secret() {
+    if [[ -n "${PULL_SECRET_FILE}" ]] && [[ -f "${PULL_SECRET_FILE}" ]]; then
+        PULL_SECRET=$(cat "${PULL_SECRET_FILE}")
+        success_msg "Pull secret loaded from ${PULL_SECRET_FILE}"
+    else
+        PULL_SECRET=""
+        warning_msg "No pull secret file provided. Cluster will be public."
+    fi
+}
 
-#az ad sp list --display-name "Azure Red Hat OpenShift RP" --query "[0].{Azure_RedHat_OpenShift_RP_ObjectId:id}"  >> app-service-principal.json
-aroResourceProviderServicePrincipalObjectId=$(az ad sp list --display-name "Azure Red Hat OpenShift RP" --query [0].id -o tsv)
-rm -r app-service-principal.json
+# Generate variables_secrets file
+generate_variables_file() {
+    local vars_file="variables_secrets"
+    
+    echo "Generating ${vars_file} file..."
+    
+    cat > "${vars_file}" <<EOF
+# IMPORTANT: This file contains sensitive information!
+# Ensure this file is in .gitignore before pushing to repository
+# This file is automatically generated by create.sh
 
-echo "\nImportant Note: Please ensure variables_secrets file is part of .gitignore file before pushing to repo" >> variables_secrets
+## Variables for tfvars file ##
 
-echo "\n## Setting Variables  ##\n" > variables_secrets
-echo "\n## following variables will be set in tfvars##\n" >> variables_secrets
+domain                        = "${ARO_DOMAIN}"
+location                      = "${LOCATION}"
+resource_group_name           = "${ARO_RESOURCE_GROUP_NAME}"
+resource_prefix               = "${RESOURCE_PREFIX}"
+virtual_network_address_space = ["10.0.0.0/22"]  # CUSTOMIZE THIS
+master_subnet_address_space   = ["10.0.0.0/23"]  # CUSTOMIZE THIS
+worker_subnet_address_space   = ["10.0.2.0/23"]  # CUSTOMIZE THIS
 
-echo "domain:$aroDomain" >> variables_secrets
-echo "location:$location " >> variables_secrets
-echo "resource_group_name:$aroResourceGroupName" >> variables_secrets
-echo "resource_prefix:$resourcePrefix" >> variables_secrets
-echo "virtual_network_address_space = " >> variables_secrets
-echo "master_subnet_address_space = " >> variables_secrets
-echo "worker_subnet_address_space = " >> variables_secrets
+## Sensitive Terraform variables for Terraform Cloud Workspace ##
 
-echo "\n## following variables will be set as sensitive terraform variables in Terraform Cloud Workspace level ##\n" >> variables_secrets
+aro_cluster_aad_sp_client_id     = "${ARO_CLUSTER_SERVICE_PRINCIPAL_CLIENT_ID}"
+aro_cluster_aad_sp_client_secret = "${ARO_CLUSTER_SERVICE_PRINCIPAL_CLIENT_SECRET}"
+aro_cluster_aad_sp_object_id      = "${ARO_CLUSTER_SERVICE_PRINCIPAL_OBJECT_ID}"
+aro_rp_aad_sp_object_id           = "${ARO_RESOURCE_PROVIDER_SERVICE_PRINCIPAL_OBJECT_ID}"
+pull_secret                       = "${PULL_SECRET}"
 
-echo "aro_cluster_aad_sp_client_id:$aroClusterServicePrincipalClientId" >> variables_secrets
-echo "aro_cluster_aad_sp_client_secret:$aroClusterServicePrincipalClientSecret" >> variables_secrets
-echo "aro_cluster_aad_sp_object_id:$aroClusterServicePrincipalObjectId" >> variables_secrets
-echo "aro_rp_aad_sp_object_id:$aroResourceProviderServicePrincipalObjectId" >> variables_secrets
-echo "pull_secret:$pullSecret" >> variables_secrets
+## Environment variables for Terraform Cloud Workspace ##
 
-echo "\n## following variables will be set as sensitive env variables in Terraform Cloud Workspace level ##\n" >> variables_secrets
+ARM_CLIENT_ID     = "${ARO_CLUSTER_SERVICE_PRINCIPAL_CLIENT_ID}"
+ARM_CLIENT_SECRET = "${ARO_CLUSTER_SERVICE_PRINCIPAL_CLIENT_SECRET}"
+ARM_SUBSCRIPTION_ID = "${SUBSCRIPTION_ID}"
+ARM_TENANT_ID     = "${TENANT_ID}"
 
-echo "ARM_CLIENT_ID:$aroClusterServicePrincipalClientId" >> variables_secrets
-echo "ARM_CLIENT_SECRET:$aroClusterServicePrincipalClientSecret" >> variables_secrets
-echo "ARM_SUBSCRIPTION_ID:$subscriptionId" >> variables_secrets
-echo "ARM_TENANT_ID:$tenantId" >>  variables_secrets
+## Secrets for GitHub repository (Settings > Secrets and variables > Actions) ##
 
+ARM_CLIENT_ID     = "${ARO_CLUSTER_SERVICE_PRINCIPAL_CLIENT_ID}"
+ARM_CLIENT_SECRET = "${ARO_CLUSTER_SERVICE_PRINCIPAL_CLIENT_SECRET}"
+ARM_SUBSCRIPTION_ID = "${SUBSCRIPTION_ID}"
+ARM_TENANT_ID     = "${TENANT_ID}"
+EOF
 
-echo "\n## following variables will be set in Github repository seetings ##\n" >> variables_secrets
+    success_msg "Variables file generated: ${vars_file}"
+    warning_msg "Please review and customize the network address spaces in ${vars_file}"
+    warning_msg "Ensure ${vars_file} is in .gitignore before committing"
+}
 
-echo "ARM_CLIENT_ID:$aroClusterServicePrincipalClientId" >> variables_secrets
-echo "ARM_CLIENT_SECRET:$aroClusterServicePrincipalClientSecret" >> variables_secrets
-echo "ARM_SUBSCRIPTION_ID: $subscriptionId " >> variables_secrets
-echo "ARM_TENANT_ID: $tenantId " >>  variables_secrets
+# Main execution
+main() {
+    echo "=========================================="
+    echo "ARO Cluster Setup Script"
+    echo "=========================================="
+    echo ""
+    
+    check_prerequisites
+    validate_config
+    get_subscription_info
+    register_providers
+    create_resource_group
+    create_service_principal
+    assign_roles
+    get_aro_rp_sp
+    read_pull_secret
+    generate_variables_file
+    
+    echo ""
+    echo "=========================================="
+    success_msg "Setup completed successfully!"
+    echo "=========================================="
+    echo ""
+    echo "Next steps:"
+    echo "1. Review and customize variables_secrets file"
+    echo "2. Ensure variables_secrets is in .gitignore"
+    echo "3. Set variables in Terraform Cloud workspace"
+    echo "4. Set secrets in GitHub repository"
+    echo "5. Update Development/dev.tfvars with your values"
+    echo ""
+}
+
+# Run main function
+main

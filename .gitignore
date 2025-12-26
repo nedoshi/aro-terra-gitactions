@@ -31,3 +31,9 @@ override.tf.json
 
 # Include tfplan files to ignore the plan output of command: terraform plan -out=tfplan
 # example: *tfplan*
+
+# Lock files (should be committed in most cases, but can be ignored if needed)
+# .terraform.lock.hcl
+
+# Ignore app-service-principal.json files created by create.sh
+app-service-principal.json

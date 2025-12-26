@@ -5,12 +5,15 @@ on:
     branches:
       - main
   pull_request:
+    branches:
+      - main
 
 env:
   ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
   ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
   ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
   ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+  TF_VAR_FILE: Development/dev.tfvars
   
 jobs:
   Terraform-Push:
@@ -20,23 +23,25 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
+        uses: hashicorp/setup-terraform@v3
         with:
-          # terraform_version: 1.4.2
+          terraform_version: "1.6.0"
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
 
       - name: Terraform Format
         id: fmt
-        run: terraform fmt 
+        run: terraform fmt -check -recursive -diff
+        continue-on-error: true
 
       - name: Terraform Init
         id: init
-        run: terraform init
+        run: terraform init -no-color
       
       - name: Terraform Validate
         id: validate
@@ -45,14 +50,15 @@ jobs:
       - name: Terraform Plan
         id: plan
         if: github.event_name == 'pull_request'
-        run: terraform plan -var-file=Development/dev.tfvars -no-color -input=false
+        run: |
+          terraform plan -var-file=${{ env.TF_VAR_FILE }} -no-color -input=false -out=tfplan
         continue-on-error: true
 
       - name: Update Pull Request
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         if: github.event_name == 'pull_request'
         env:
-          PLAN: ${{ steps.plan.outputs.stdout }}
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -63,7 +69,7 @@ jobs:
 
             <details><summary>Show Plan</summary>
 
-            \`\`\`terraform\n
+            \`\`\`terraform
             ${process.env.PLAN}
             \`\`\`
 
@@ -84,5 +90,5 @@ jobs:
 
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: terraform apply -var-file=Development/dev.tfvars -auto-approve -input=false
+        run: terraform apply -var-file=${{ env.TF_VAR_FILE }} -auto-approve -input=false -no-color
         

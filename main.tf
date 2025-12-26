@@ -1,27 +1,9 @@
-terraform {
-  required_version = ">= 1.0"
-  required_providers {
-    azurerm = {
-      source  = "hashicorp/azurerm"
-      version = ">=3.3.0"
-    }
-    azapi = {
-      source  = "Azure/azapi"
-      version = ">=1.0.0"
-    }
-  }
-  cloud {
-    organization = "OpenShift"
-
-    workspaces {
-      name = "aro-terra-gitaction"
-    }
-  }
-
-}
-
 provider "azurerm" {
-  features {}
+  features {
+    resource_group {
+      prevent_deletion_if_contains_resources = false
+    }
+  }
 }
 
 provider "azapi" {
@@ -106,7 +88,7 @@ resource "azapi_resource" "aro_cluster" {
         domain               = var.domain
         fipsValidatedModules = var.fips_validated_modules
         resourceGroupId      = local.resource_group_id
-        #        pullSecret           = var.pull_secret
+        pullSecret           = var.pull_secret != "" ? var.pull_secret : null
       }
       networkProfile = {
         podCidr     = var.pod_cidr
